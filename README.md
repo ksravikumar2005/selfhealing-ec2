@@ -7,7 +7,7 @@
 
 An end-to-end **Chaos Engineering, Autonomous Investigation, and Self-Healing EC2 Testbed** designed for **AWS DevOps Agent** and **AWS CloudShell**.
 
-This project provisions an Amazon EC2 instance with the CloudWatch Agent and OS-level stall protection, induces progressive operating system exhaustion (**Memory $\rightarrow$ Swap $\rightarrow$ Disk Space $\rightarrow$ EBS Throughput & I/O**), automatically captures deep kernel/process forensic dumps into CloudWatch Logs via AWS Systems Manager (SSM) when thresholds breach, triggers **AWS DevOps Agent** via signed HMAC-SHA256 webhooks for autonomous root-cause investigation, and self-heals the instance.
+This project provisions an Amazon EC2 instance with the CloudWatch Agent and OS-level stall protection, induces progressive operating system exhaustion (**Memory -> Swap -> Disk Space -> EBS Throughput & I/O**), automatically captures deep kernel/process forensic dumps into CloudWatch Logs via AWS Systems Manager (SSM) when thresholds breach, triggers **AWS DevOps Agent** via signed HMAC-SHA256 webhooks for autonomous root-cause investigation, and self-heals the instance.
 
 ---
 
@@ -59,11 +59,11 @@ flowchart TD
 ## Key Capabilities
 
 - **Progressive 4-Stage Load Inducer Lambda (`LoadInducer`)**:
-  - **Stage 1 — Physical Memory Exhaustion (`memory`)**: Uses `stress-ng --vm` to allocate ~86% of physical RAM.
-  - **Stage 2 — Swap Exhaustion (`swap`)**: Allocates 92% of RAM + 65% of the 1.5 GB swap file (`vm.swappiness=80`) to force heavy swap paging.
-  - **Stage 3 — Disk Space Exhaustion (`disk_space`)**: Uses `fallocate`/`dd` to write `/var/tmp/da-disk-ballast.img` until root filesystem utilization exceeds 90%.
-  - **Stage 4 — EBS Throughput & IOPS Saturation (`ebs_io`)**: Uses `fio` with `O_DIRECT`, `libaio`, and `iodepth=64` to saturate EBS bandwidth and IOPS.
-  - **Chained Mode (`chained`)**: Automatically executes Stage 1 $\rightarrow$ Stage 2 $\rightarrow$ Stage 3 $\rightarrow$ Stage 4 sequentially.
+  - **Stage 1: Physical Memory Exhaustion (`memory`)**: Uses `stress-ng --vm` to allocate ~86% of physical RAM.
+  - **Stage 2: Swap Exhaustion (`swap`)**: Allocates 92% of RAM + 65% of the 1.5 GB swap file (`vm.swappiness=80`) to force heavy swap paging.
+  - **Stage 3: Disk Space Exhaustion (`disk_space`)**: Uses `fallocate`/`dd` to write `/var/tmp/da-disk-ballast.img` until root filesystem utilization exceeds 90%.
+  - **Stage 4: EBS Throughput & IOPS Saturation (`ebs_io`)**: Uses `fio` with `O_DIRECT`, `libaio`, and `iodepth=64` to saturate EBS bandwidth and IOPS.
+  - **Chained Mode (`chained`)**: Automatically executes Stage 1 -> Stage 2 -> Stage 3 -> Stage 4 sequentially.
 - **OS Stall Protection (Survives 100% Disk Full & OOM)**:
   - Mounts `/var/log/da-forensics` as a **64 MB RAM-backed `tmpfs`** so SSM forensic dumps and CloudWatch Agent log streaming never fail with `ENOSPC` when `/` is 100% full or EBS I/O is stalled.
   - Applies `systemd` overrides (`OOMScoreAdjust=-1000`, `Nice=-15`, `CPUWeight=10000`, `IOWeight=10000`, `IOSchedulingClass=realtime`) to `amazon-ssm-agent` and `amazon-cloudwatch-agent`.
@@ -78,19 +78,19 @@ flowchart TD
 ## Repository Structure
 
 ```text
-├── cloudformation/
-│   └── da-auto-investigation-stack.yaml   # Complete CloudFormation template (EC2, SSM, Lambdas, Alarms, SNS, IAM)
-├── scripts/
-│   ├── deploy.sh                          # Bash deployer (auto-discovers VPC/Subnet & AWS_DevOps_Agent_Role)
-│   ├── deploy.ps1                         # PowerShell deployer for Windows
-│   ├── trigger-load.sh                    # Bash CLI helper to invoke LoadInducer Lambda
-│   ├── trigger-load.ps1                   # PowerShell helper to invoke LoadInducer Lambda
-│   └── cleanup.sh                         # Clean stack teardown script
-├── docs/
-│   ├── DEVOPS-AGENT-WEBHOOK-SPEC.md       # Webhook payload schema & HMAC-SHA256 signing specification
-│   └── FORENSICS-AND-SELF-HEALING.md      # Deep-dive on tmpfs stall protection & forensic dump sections
-├── cloudshell-install.sh                  # Single-file standalone installer for AWS CloudShell
-└── README.md
+|-- cloudformation/
+|   `-- da-auto-investigation-stack.yaml   # Complete CloudFormation template (EC2, SSM, Lambdas, Alarms, SNS, IAM)
+|-- scripts/
+|   |-- deploy.sh                          # Bash deployer (auto-discovers VPC/Subnet & AWS_DevOps_Agent_Role)
+|   |-- deploy.ps1                         # PowerShell deployer for Windows
+|   |-- trigger-load.sh                    # Bash CLI helper to invoke LoadInducer Lambda
+|   |-- trigger-load.ps1                   # PowerShell helper to invoke LoadInducer Lambda
+|   `-- cleanup.sh                         # Clean stack teardown script
+|-- docs/
+|   |-- DEVOPS-AGENT-WEBHOOK-SPEC.md       # Webhook payload schema & HMAC-SHA256 signing specification
+|   `-- FORENSICS-AND-SELF-HEALING.md      # Deep-dive on tmpfs stall protection & forensic dump sections
+|-- cloudshell-install.sh                  # Single-file standalone installer for AWS CloudShell
+`-- README.md
 ```
 
 ---
@@ -102,7 +102,7 @@ Open **AWS CloudShell** in your AWS Console and run:
 ### Option A: Clone from GitHub (Recommended)
 
 ```bash
-git clone https://github.com/<your-github-org>/selfhealing-ec2.git
+git clone https://github.com/ksravikumar2005/selfhealing-ec2.git
 cd selfhealing-ec2
 
 export DEVOPS_AGENT_WEBHOOK_URL="https://<your-devops-agent-webhook-url>"
@@ -120,7 +120,7 @@ chmod +x scripts/*.sh
 
 ### Option B: Single-File Upload (`cloudshell-install.sh`)
 
-1. In AWS CloudShell, click **Actions** $\rightarrow$ **Upload file** and select `cloudshell-install.sh`.
+1. In AWS CloudShell, click **Actions** -> **Upload file** and select `cloudshell-install.sh`.
 2. Run:
    ```bash
    chmod +x ~/cloudshell-install.sh
@@ -219,16 +219,16 @@ You can override any parameter via environment variables when running `./scripts
 
 | Environment Variable | CloudFormation Parameter | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `STACK_NAME` | — | `da-auto-investigation` | CloudFormation stack name |
-| `AWS_REGION` | — | CLI default region, else `us-east-1` | Region to deploy into |
-| `DEPLOY_BUCKET` | — | `<STACK_NAME>-cfn-<ACCOUNT_ID>-<REGION>` (auto-created) | S3 bucket used to stage the packaged template |
+| `STACK_NAME` | N/A | `da-auto-investigation` | CloudFormation stack name |
+| `AWS_REGION` | N/A | CLI default region, else `us-east-1` | Region to deploy into |
+| `DEPLOY_BUCKET` | N/A | `<STACK_NAME>-cfn-<ACCOUNT_ID>-<REGION>` (auto-created) | S3 bucket used to stage the packaged template |
 | `VPC_ID` / `SUBNET_ID` | `VpcId` / `SubnetId` | Default VPC and a public subnet (auto-discovered) | Network placement for the target instance |
 | `INSTANCE_TYPE` | `InstanceType` | `t3.medium` | Target EC2 instance size (`t3.small`, `t3.medium`, `t3.large`, `m6i.large`) |
 | `DEVOPS_AGENT_WEBHOOK_URL` | `DevOpsAgentWebhookUrl` | Placeholder URL | AWS DevOps Agent Space Incoming Webhook URL |
 | `DEVOPS_AGENT_WEBHOOK_SECRET` | `DevOpsAgentWebhookSecret` | Placeholder Secret | HMAC-SHA256 secret for signing webhook requests |
 | `DEVOPS_AGENT_ROLE_NAME` | `DevOpsAgentRoleName` | `AWS_DevOps_Agent_Role` | Existing DevOps Agent IAM role in the account |
 | `ENABLE_SELF_HEALING` | `EnableAutoSelfHealing` | `true` | Automatically remediate runaway processes after dumping forensics |
-| `ANOMALY_BAND_WIDTH` | `AnomalyDetectionBandWidth` | `2` | Standard deviations (`1`–`10`) for `ANOMALY_DETECTION_BAND(m1, stdDevs)` |
+| `ANOMALY_BAND_WIDTH` | `AnomalyDetectionBandWidth` | `2` | Standard deviations (`1` to `10`) for `ANOMALY_DETECTION_BAND(m1, stdDevs)` |
 
 ---
 
