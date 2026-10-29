@@ -18,10 +18,11 @@ This project provisions an Amazon EC2 instance with the CloudWatch Agent and OS-
 - [Repository Structure](#repository-structure)
 - [1-Minute Install in AWS CloudShell](#1-minute-install-in-aws-cloudshell)
 - [Inducing OS Load (Chaos Scenarios)](#inducing-os-load-chaos-scenarios)
-- [CloudWatch Alarms & Thresholds](#cloudwatch-alarms--thresholds)
-- [Observing Forensic Dumps & Self-Healing](#observing-forensic-dumps--self-healing)
+- [CloudWatch Anomaly Detection Alarms](#cloudwatch-anomaly-detection-alarms)
+- [Automatic Streaming of OS Forensic Dumps & Self-Healing Output](#automatic-streaming-of-os-forensic-dumps--self-healing-output-to-cloudwatch-logs)
 - [Configuration Parameters](#configuration-parameters)
 - [Cleanup & Teardown](#cleanup--teardown)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -101,8 +102,8 @@ Open **AWS CloudShell** in your AWS Console and run:
 ### Option A: Clone from GitHub (Recommended)
 
 ```bash
-git clone https://github.com/<your-github-org>/da-auto-investigation.git
-cd da-auto-investigation
+git clone https://github.com/<your-github-org>/selfhealing-ec2.git
+cd selfhealing-ec2
 
 export DEVOPS_AGENT_WEBHOOK_URL="https://<your-devops-agent-webhook-url>"
 export DEVOPS_AGENT_WEBHOOK_SECRET="<your-webhook-hmac-secret>"
@@ -110,6 +111,12 @@ export DEVOPS_AGENT_WEBHOOK_SECRET="<your-webhook-hmac-secret>"
 chmod +x scripts/*.sh
 ./scripts/deploy.sh
 ```
+
+> [!NOTE]
+> **S3 staging bucket**: The CloudFormation template is larger than the 51,200-byte inline limit, so `deploy.sh` uploads it to S3 before deploying. On first run it creates a private bucket named `<STACK_NAME>-cfn-<ACCOUNT_ID>-<REGION>` (public access fully blocked) and reuses it on later runs. Set `DEPLOY_BUCKET` to use an existing bucket instead. The deploying identity needs `sts:GetCallerIdentity`, `s3:CreateBucket`, `s3:PutBucketPublicAccessBlock`, `s3:ListBucket`, and `s3:PutObject`.
+
+> [!CAUTION]
+> Never paste or commit your real `DEVOPS_AGENT_WEBHOOK_SECRET`. If it has been exposed, rotate it in your DevOps Agent Space webhook settings before deploying.
 
 ### Option B: Single-File Upload (`cloudshell-install.sh`)
 
@@ -213,6 +220,9 @@ You can override any parameter via environment variables when running `./scripts
 | Environment Variable | CloudFormation Parameter | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `STACK_NAME` | — | `da-auto-investigation` | CloudFormation stack name |
+| `AWS_REGION` | — | CLI default region, else `us-east-1` | Region to deploy into |
+| `DEPLOY_BUCKET` | — | `<STACK_NAME>-cfn-<ACCOUNT_ID>-<REGION>` (auto-created) | S3 bucket used to stage the packaged template |
+| `VPC_ID` / `SUBNET_ID` | `VpcId` / `SubnetId` | Default VPC and a public subnet (auto-discovered) | Network placement for the target instance |
 | `INSTANCE_TYPE` | `InstanceType` | `t3.medium` | Target EC2 instance size (`t3.small`, `t3.medium`, `t3.large`, `m6i.large`) |
 | `DEVOPS_AGENT_WEBHOOK_URL` | `DevOpsAgentWebhookUrl` | Placeholder URL | AWS DevOps Agent Space Incoming Webhook URL |
 | `DEVOPS_AGENT_WEBHOOK_SECRET` | `DevOpsAgentWebhookSecret` | Placeholder Secret | HMAC-SHA256 secret for signing webhook requests |
@@ -229,3 +239,36 @@ To delete all resources created by the stack:
 ```bash
 ./scripts/cleanup.sh
 ```
+
+After the stack is deleted, `cleanup.sh` also removes the template staging storage:
+
+- **Auto-created bucket** (`DEPLOY_BUCKET` not set): the `<STACK_NAME>-cfn-<ACCOUNT_ID>-<REGION>` bucket is emptied and deleted.
+- **Your own bucket** (`DEPLOY_BUCKET` set): only objects under the `<STACK_NAME>/` prefix are removed. The bucket itself is kept.
+
+Use the same `STACK_NAME`, `AWS_REGION`, and `DEPLOY_BUCKET` values you deployed with.
+
+---
+
+## Troubleshooting
+
+### `Templates with a size greater than 51,200 bytes must be deployed via an S3 Bucket`
+
+You are running an older `deploy.sh`. Pull the latest version, which stages the template in S3 automatically (see the S3 staging bucket note above).
+
+### `Failed to create the changeset ... [AWS::EarlyValidation::PropertyValidation]`
+
+CloudFormation pre-validates resource properties before creating the change set. This error means one or more property values in the template or parameters were rejected; the CLI message does not say which. Get the details with:
+
+```bash
+aws cloudformation describe-events \
+  --region "${AWS_REGION:-us-east-1}" \
+  --stack-name da-auto-investigation \
+  --query "OperationEvents[?EventType=='VALIDATION_ERROR'].[LogicalResourceId,ValidationPath,ValidationStatusReason]" \
+  --output table
+```
+
+The output names the failing resource and property path. A failed change set leaves the stack in `REVIEW_IN_PROGRESS`; if it was never created successfully, delete it with `./scripts/cleanup.sh` before retrying.
+
+### `Role 'AWS_DevOps_Agent_Role' not found`
+
+Informational only. The Bridge Lambda still triggers the SSM runbook. Set `DEVOPS_AGENT_ROLE_NAME` if your DevOps Agent role uses a different name.
