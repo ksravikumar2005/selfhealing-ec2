@@ -1,0 +1,1542 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# Single-File AWS CloudShell Installer:
+# DevOps Agent Autonomous Investigation & Self-Healing EC2 Chaos Testbed
+# ==============================================================================
+# Usage in AWS CloudShell:
+#   1. Upload cloudshell-install.sh (Actions -> Upload file)
+#   2. Run:
+#      chmod +x ~/cloudshell-install.sh
+#      DEVOPS_AGENT_WEBHOOK_URL="https://..." DEVOPS_AGENT_WEBHOOK_SECRET="..." ~/cloudshell-install.sh
+# ==============================================================================
+
+STACK_NAME="${STACK_NAME:-da-auto-investigation}"
+REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo 'us-east-1')}"
+INSTANCE_TYPE="${INSTANCE_TYPE:-t3.medium}"
+WEBHOOK_URL="${DEVOPS_AGENT_WEBHOOK_URL:-https://placeholder.aidevops.amazonaws.com/webhook/v1/incident}"
+WEBHOOK_SECRET="${DEVOPS_AGENT_WEBHOOK_SECRET:-PLACEHOLDER_WEBHOOK_SECRET_CHANGE_ME}"
+AGENT_ROLE_NAME="${DEVOPS_AGENT_ROLE_NAME:-AWS_DevOps_Agent_Role}"
+ENABLE_SELF_HEALING="${ENABLE_SELF_HEALING:-true}"
+ANOMALY_BAND_WIDTH="${ANOMALY_BAND_WIDTH:-2}"
+
+WORKDIR="${HOME}/da-auto-investigation"
+mkdir -p "${WORKDIR}/cloudformation" "${WORKDIR}/scripts"
+
+echo "=================================================================="
+echo " AWS CloudShell Installer : ${STACK_NAME}"
+echo " Region                   : ${REGION}"
+echo " Anomaly Band Width       : ${ANOMALY_BAND_WIDTH} std devs"
+echo " Working Directory        : ${WORKDIR}"
+echo "=================================================================="
+cat << 'EOF_CFN_TEMPLATE' > "${WORKDIR}/cloudformation/da-auto-investigation-stack.yaml"
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  AWS DevOps Agent Autonomous Investigation & Self-Healing EC2 Chaos Testbed.
+  Provisions an Amazon Linux 2023 EC2 instance with Swap, CloudWatch Agent, and OOM/Disk-Full
+  stall protection (tmpfs forensic log mount + systemd priority overrides), SSM Runbooks for
+  OS Forensics Dumps and Self-Healing, a Load-Inducer Lambda function (Memory -> Swap -> Disk Space
+  -> EBS I/O & Throughput), CloudWatch OS Alarms, and an Alarm-to-DevOps-Agent Webhook Bridge Lambda.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the target EC2 instance will be deployed.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID (with outbound internet or SSM/CloudWatch VPC endpoints) for the EC2 instance.
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - m6i.large
+    Description: EC2 instance type for load testing and autonomous investigation.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: Latest Amazon Linux 2023 AMI ID from SSM Parameter Store.
+
+  DevOpsAgentWebhookUrl:
+    Type: String
+    Default: https://placeholder.aidevops.amazonaws.com/webhook/v1/incident
+    Description: >-
+      Existing AWS DevOps Agent Space Incoming Webhook URL. Update in Secrets Manager anytime
+      or pass at stack deployment.
+
+  DevOpsAgentWebhookSecret:
+    Type: String
+    NoEcho: true
+    Default: PLACEHOLDER_WEBHOOK_SECRET_CHANGE_ME
+    Description: >-
+      HMAC-SHA256 Signing Secret for the AWS DevOps Agent Webhook.
+
+  DevOpsAgentRoleName:
+    Type: String
+    Default: AWS_DevOps_Agent_Role
+    Description: >-
+      Name of the existing AWS DevOps Agent IAM Role in this account (used when AttachRunbookPolicyToAgentRole is true).
+
+  AttachRunbookPolicyToAgentRole:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Set to true to attach an IAM policy to DevOpsAgentRoleName allowing the DevOps Agent to directly invoke the SSM Forensic & Self-Healing Runbook.
+
+  EnableAutoSelfHealing:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Whether the SSM Forensic Runbook should automatically terminate offending stress processes
+      and clean up disk ballast files after dumping OS diagnostics to CloudWatch Logs.
+
+  SelfHealDelaySeconds:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 300
+    Description: >-
+      Seconds to wait after capturing the initial forensic dump before self-healing terminates
+      the runaway load (gives CloudWatch Metrics and DevOps Agent a sustained breach window).
+
+  AnomalyDetectionBandWidth:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: >-
+      CloudWatch Anomaly Detection band width (number of standard deviations from the expected
+      metric baseline) used in ANOMALY_DETECTION_BAND(m1, stdDevs) across all OS alarms.
+
+Conditions:
+  ShouldAttachAgentRolePolicy: !Equals [!Ref AttachRunbookPolicyToAgentRole, 'true']
+
+Resources:
+  # ============================================================================
+  # 0. OPTIONAL IAM POLICY ALLOWING DEVOPS AGENT ROLE TO EXECUTE SSM RUNBOOK
+  # ============================================================================
+  DevOpsAgentSSMRunbookPolicy:
+    Type: AWS::IAM::Policy
+    Condition: ShouldAttachAgentRolePolicy
+    Properties:
+      PolicyName: AllowDevOpsAgentOSForensicsAndSelfHealRunbook
+      Roles:
+        - !Ref DevOpsAgentRoleName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowTriggerOSForensicsRunbook
+            Effect: Allow
+            Action:
+              - ssm:SendCommand
+              - ssm:GetCommandInvocation
+              - ssm:ListCommandInvocations
+              - ssm:DescribeInstanceInformation
+            Resource:
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${OSForensicsAndSelfHealDocument}
+              - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${TargetEC2Instance}
+              - !Sub arn:aws:ssm:${AWS::Region}:*:managed-instance/*
+  # ============================================================================
+  # 1. CLOUDWATCH LOG GROUP FOR OS FORENSICS & DIAGNOSTIC DUMPS
+  # ============================================================================
+  OSForensicsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/ec2/${AWS::StackName}/os-forensics
+      RetentionInDays: 14
+
+  # ============================================================================
+  # 2. SECRETS MANAGER FOR DEVOPS AGENT WEBHOOK CREDENTIALS
+  # ============================================================================
+  DevOpsAgentWebhookSecretResource:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}-devops-agent-webhook
+      Description: Webhook URL and HMAC Secret for triggering AWS DevOps Agent investigations.
+      SecretString: !Sub |
+        {
+          "WEBHOOK_URL": "${DevOpsAgentWebhookUrl}",
+          "WEBHOOK_SECRET": "${DevOpsAgentWebhookSecret}"
+        }
+
+  # ============================================================================
+  # 3. EC2 IAM ROLE, INSTANCE PROFILE, AND SECURITY GROUP
+  # ============================================================================
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-EC2-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: AllowDirectForensicLogWrites
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !GetAtt OSForensicsLogGroup.Arn
+                  - !Sub ${OSForensicsLogGroup.Arn}:*
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for DevOps Agent Self-Healing Target EC2 Instance (SSM managed, no inbound ports required)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound HTTPS to SSM, CloudWatch Logs, and package repos
+
+  # ============================================================================
+  # 4. TARGET EC2 INSTANCE WITH SWAP, CLOUDWATCH AGENT, AND STALL PROTECTION
+  # ============================================================================
+  TargetEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      Monitoring: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            Iops: 3000
+            Throughput: 125
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Chaos-Target
+        - Key: ManagedBy
+          Value: AWS-DevOps-Agent-Testbed
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          # 1. Install stress testing, I/O benchmarking, and OS forensic utilities
+          dnf update -y
+          dnf install -y amazon-cloudwatch-agent stress-ng fio sysstat iotop psmisc lsof jq procps-ng util-linux
+
+          # 2. Create a dedicated RAM-backed tmpfs mount for forensic logs (/var/log/da-forensics)
+          #    This guarantees that even when root disk is 100% full or EBS I/O is stalled,
+          #    SSM forensic dumps and CloudWatch Agent log shipping continue without ENOSPC!
+          mkdir -p /var/log/da-forensics
+          if ! grep -q "/var/log/da-forensics" /etc/fstab; then
+            echo "tmpfs /var/log/da-forensics tmpfs defaults,size=64m,mode=0755 0 0" >> /etc/fstab
+          fi
+          mount -a
+          touch /var/log/da-forensics/forensics.log
+          touch /var/log/da-forensics/load-generator.log
+          chmod 644 /var/log/da-forensics/*.log
+
+          # 3. Configure 1.5 GB Swap file so Swap exhaustion can be tested and monitored
+          if [ ! -f /swapfile ]; then
+            dd if=/dev/zero of=/swapfile bs=1M count=1536 status=none
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+          fi
+          sysctl -w vm.swappiness=80
+          echo "vm.swappiness=80" > /etc/sysctl.d/99-da-swappiness.conf
+
+          # 4. Protect amazon-ssm-agent and amazon-cloudwatch-agent from OOM Killer and I/O starvation
+          #    If the OS stalls under extreme memory/swap/IO pressure, these agents stay alive.
+          mkdir -p /etc/systemd/system/amazon-ssm-agent.service.d
+          cat << 'EOF' > /etc/systemd/system/amazon-ssm-agent.service.d/override.conf
+          [Service]
+          OOMScoreAdjust=-1000
+          Nice=-15
+          CPUWeight=10000
+          IOWeight=10000
+          IOSchedulingClass=realtime
+          IOSchedulingPriority=0
+          EOF
+
+          mkdir -p /etc/systemd/system/amazon-cloudwatch-agent.service.d
+          cat << 'EOF' > /etc/systemd/system/amazon-cloudwatch-agent.service.d/override.conf
+          [Service]
+          OOMScoreAdjust=-1000
+          Nice=-15
+          CPUWeight=10000
+          IOWeight=10000
+          IOSchedulingClass=realtime
+          IOSchedulingPriority=0
+          EOF
+
+          systemctl daemon-reload
+          systemctl restart amazon-ssm-agent
+
+          # 5. Configure CloudWatch Agent for high-resolution OS metrics (10s) and forensic log streaming
+          cat << 'EOF' > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+          {
+            "agent": {
+              "metrics_collection_interval": 10,
+              "run_as_user": "root"
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/da-forensics/forensics.log",
+                      "log_group_name": "/aws/ec2/${AWS::StackName}/os-forensics",
+                      "log_stream_name": "{instance_id}/forensic-dumps",
+                      "retention_in_days": 14,
+                      "timezone": "UTC"
+                    },
+                    {
+                      "file_path": "/var/log/da-forensics/load-generator.log",
+                      "log_group_name": "/aws/ec2/${AWS::StackName}/os-forensics",
+                      "log_stream_name": "{instance_id}/load-generator",
+                      "retention_in_days": 14,
+                      "timezone": "UTC"
+                    }
+                  ]
+                }
+              },
+              "force_flush_interval": 5
+            },
+            "metrics": {
+              "namespace": "CWAgent",
+              "append_dimensions": {
+                "InstanceId": "${!aws:InstanceId}"
+              },
+              "aggregation_dimensions": [
+                ["InstanceId"]
+              ],
+              "metrics_collected": {
+                "cpu": {
+                  "measurement": [
+                    "cpu_usage_active",
+                    "cpu_usage_iowait",
+                    "cpu_usage_system",
+                    "cpu_usage_user"
+                  ],
+                  "metrics_collection_interval": 10,
+                  "totalcpu": true
+                },
+                "mem": {
+                  "measurement": [
+                    "mem_used_percent",
+                    "mem_available",
+                    "mem_available_percent",
+                    "mem_used",
+                    "mem_total"
+                  ],
+                  "metrics_collection_interval": 10
+                },
+                "swap": {
+                  "measurement": [
+                    "swap_used_percent",
+                    "swap_used",
+                    "swap_free"
+                  ],
+                  "metrics_collection_interval": 10
+                },
+                "disk": {
+                  "measurement": [
+                    "used_percent",
+                    "inodes_free",
+                    "free",
+                    "used"
+                  ],
+                  "metrics_collection_interval": 10,
+                  "resources": [
+                    "/"
+                  ],
+                  "drop_device": true
+                },
+                "diskio": {
+                  "measurement": [
+                    "io_time",
+                    "write_bytes",
+                    "read_bytes",
+                    "writes",
+                    "reads",
+                    "iops_in_progress"
+                  ],
+                  "metrics_collection_interval": 10,
+                  "resources": [
+                    "*"
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+
+          # 6. Install local Emergency Stall Watchdog (safety net if OS completely locks up before SSM arrives)
+          cat << 'EOF' > /usr/local/bin/da-local-watchdog.sh
+          #!/bin/bash
+          FORENSICS_LOG="/var/log/da-forensics/forensics.log"
+          MEM_AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+          SWAP_FREE_KB=$(awk '/SwapFree/ {print $2}' /proc/meminfo)
+          [ -z "$MEM_AVAIL_KB" ] && MEM_AVAIL_KB=999999
+          [ -z "$SWAP_FREE_KB" ] && SWAP_FREE_KB=999999
+
+          if [ "$MEM_AVAIL_KB" -lt 45000 ] && [ "$SWAP_FREE_KB" -lt 25000 ]; then
+            echo "=== [LOCAL-WATCHDOG-EMERGENCY-DUMP] $(date -u +%Y-%m-%dT%H:%M:%SZ) CRITICAL OOM+SWAP STALL IMMINENT ===" >> "$FORENSICS_LOG"
+            ps aux --sort=-%mem | head -n 15 >> "$FORENSICS_LOG"
+            free -m >> "$FORENSICS_LOG"
+            vmstat 1 2 >> "$FORENSICS_LOG"
+          fi
+          EOF
+          chmod +x /usr/local/bin/da-local-watchdog.sh
+          echo "* * * * * root /usr/local/bin/da-local-watchdog.sh" > /etc/cron.d/da-local-watchdog
+
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [BOOTSTRAP] EC2 instance ready for DevOps Agent investigation & chaos load tests." >> /var/log/da-forensics/forensics.log
+
+  # ============================================================================
+  # 5. SSM RUNBOOK 1: OS FORENSIC DUMP & SELF-HEALING REMEDIATION
+  #    Triggered automatically by Alarm Bridge Lambda AND callable by DevOps Agent
+  # ============================================================================
+  OSForensicsAndSelfHealDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub ${AWS::StackName}-OSForensicsAndSelfHeal
+      DocumentType: Command
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '2.2'
+        description: >-
+          Dumps detailed EC2 OS process, memory, swap, disk space, and EBS I/O forensics
+          to /var/log/da-forensics/forensics.log (shipped via CloudWatch Agent to CloudWatch Logs)
+          for AWS DevOps Agent root-cause investigation, then optionally executes self-healing.
+        parameters:
+          BreachType:
+            type: String
+            default: ALL
+            description: Alarm breach category (MEMORY, SWAP, DISK_SPACE, EBS_IO, or ALL)
+          AlarmName:
+            type: String
+            default: ManualInvocation
+            description: Name of the CloudWatch Alarm that triggered this runbook
+          IncidentId:
+            type: String
+            default: manual-incident
+            description: Correlation Incident ID sent to AWS DevOps Agent
+          EnableSelfHealing:
+            type: String
+            default: !Ref EnableAutoSelfHealing
+            allowedValues:
+              - 'true'
+              - 'false'
+            description: Whether to terminate offending stress processes and clean ballast files after dumping forensics
+          HealDelaySeconds:
+            type: String
+            default: !Sub '${SelfHealDelaySeconds}'
+            description: Seconds to wait after capturing forensics before executing self-healing
+        mainSteps:
+          - action: aws:runShellScript
+            name: CaptureOSForensicsAndSelfHeal
+            inputs:
+              runCommand:
+                - |
+                  #!/bin/bash
+                  set -u
+                  LOG_FILE="/var/log/da-forensics/forensics.log"
+                  mkdir -p /var/log/da-forensics
+                  TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+                  HOST=$(hostname)
+                  BREACH="{{ BreachType }}"
+                  ALARM="{{ AlarmName }}"
+                  INCIDENT="{{ IncidentId }}"
+                  SELF_HEAL="{{ EnableSelfHealing }}"
+                  HEAL_DELAY="{{ HealDelaySeconds }}"
+
+                  {
+                    echo "================================================================================"
+                    echo "[FORENSIC_DUMP_START] timestamp=${TS} incident_id=${INCIDENT} alarm=${ALARM} breach_type=${BREACH} host=${HOST}"
+                    echo "================================================================================"
+
+                    echo "--- [1. SYSTEM UPTIME, LOAD AVERAGE & KERNEL PRESSURE] ---"
+                    uptime
+                    cat /proc/loadavg
+                    if [ -f /proc/pressure/memory ]; then
+                      echo "PSI Memory: $(cat /proc/pressure/memory | tr '\n' ' ')"
+                      echo "PSI IO:     $(cat /proc/pressure/io | tr '\n' ' ')"
+                      echo "PSI CPU:    $(cat /proc/pressure/cpu | tr '\n' ' ')"
+                    fi
+
+                    echo "--- [2. MEMORY & SWAP BREAKDOWN (free -m / /proc/meminfo / swapon)] ---"
+                    free -m
+                    swapon --show || true
+                    grep -E "MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapCached|SwapTotal|SwapFree|Dirty|Writeback|AnonPages|Slab" /proc/meminfo
+
+                    echo "--- [3. TOP 15 MEMORY-CONSUMING PROCESSES] ---"
+                    ps -eo pid,ppid,user,%mem,%cpu,rss,vsz,stat,comm,args --sort=-%mem | head -n 16
+
+                    echo "--- [4. TOP 10 SWAP-CONSUMING PROCESSES (/proc/*/status VmSwap)] ---"
+                    for status_file in /proc/[0-9]*/status; do
+                      if [ -r "$status_file" ]; then
+                        awk '/^Pid:/{pid=$2} /^Name:/{name=$2} /^VmSwap:/{swap=$2} END{if(swap>0) printf "PID=%-8s SWAP_KB=%-10s COMM=%s\n", pid, swap, name}' "$status_file" 2>/dev/null
+                      fi
+                    done | sort -k2 -nr | head -n 10
+
+                    echo "--- [5. TOP 15 CPU & D-STATE (UNINTERRUPTIBLE I/O SLEEP) PROCESSES] ---"
+                    ps -eo pid,ppid,user,%cpu,%mem,stat,wchan:20,comm,args --sort=-%cpu | head -n 16
+                    echo "Processes stuck in uninterruptible D-state (I/O stall):"
+                    ps -eo pid,user,stat,wchan:25,comm,args | awk '$3 ~ /D/' || true
+
+                    echo "--- [6. DISK SPACE, INODES & LARGEST BALLAST/TEMP FILES] ---"
+                    df -hT
+                    df -i
+                    echo "Largest files in /var/tmp and /tmp:"
+                    find /var/tmp /tmp -type f -printf "%s\t%p\n" 2>/dev/null | sort -nr | head -n 15 | awk '{printf "%.2f MB\t%s\n", $1/1048576, $2}'
+                    echo "Deleted files still held open by processes (lsof +L1):"
+                    lsof +L1 2>/dev/null | head -n 15 || true
+
+                    echo "--- [7. EBS DISK I/O & THROUGHPUT SATURATION (iostat / pidstat / vmstat)] ---"
+                    iostat -xz 1 2 || true
+                    pidstat -d 1 2 || true
+                    vmstat 1 2 || true
+
+                    echo "--- [8. RECENT KERNEL / OOM-KILLER EVENTS (dmesg)] ---"
+                    dmesg -T | grep -iE "oom|killed process|out of memory|hung_task|io error|ext4|xfs" | tail -n 25 || true
+
+                    echo "[FORENSIC_DUMP_COMPLETE] timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") incident_id=${INCIDENT}"
+                  } | tee -a "$LOG_FILE"
+
+                  # Force CloudWatch Agent flush by syncing filesystem buffers
+                  sync
+
+                  if [ "$SELF_HEAL" = "true" ]; then
+                    echo "[SELF_HEALING_SCHEDULED] Waiting ${HEAL_DELAY}s before remediating ${BREACH} so metrics & forensics flush..." | tee -a "$LOG_FILE"
+                    sleep "$HEAL_DELAY"
+
+                    {
+                      echo "================================================================================"
+                      echo "[SELF_HEALING_START] timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") incident_id=${INCIDENT} breach_type=${BREACH}"
+                      echo "================================================================================"
+
+                      # 1. Terminate synthetic load / runaway stress processes (stress-ng, fio, dd ballast writers)
+                      pkill -9 -f "stress-ng" 2>/dev/null && echo "Terminated runaway stress-ng processes." || true
+                      pkill -9 -f "fio" 2>/dev/null && echo "Terminated runaway fio I/O processes." || true
+                      pkill -9 -f "dd if=/dev/zero" 2>/dev/null && echo "Terminated runaway dd processes." || true
+                      pkill -9 -f "da-chained-load" 2>/dev/null && echo "Terminated chained load orchestrator." || true
+
+                      # 2. Remove disk space exhaustion ballast files and fio scratch files
+                      rm -rf /var/tmp/da-disk-ballast* /var/tmp/da-io-test* /tmp/da-disk-ballast* /tmp/fio-*
+                      echo "Cleaned up disk ballast and I/O scratch files in /var/tmp and /tmp."
+
+                      # 3. Drop clean page cache and cycle swap if memory is available
+                      sync
+                      echo 3 > /proc/sys/vm/drop_caches || true
+                      MEM_FREE_MB=$(free -m | awk '/^Mem:/ {print $7}')
+                      SWAP_USED_MB=$(free -m | awk '/^Swap:/ {print $3}')
+                      if [ "${SWAP_USED_MB:-0}" -gt 10 ] && [ "${MEM_FREE_MB:-0}" -gt "${SWAP_USED_MB:-0}" ]; then
+                        swapoff -a && swapon -a && echo "Cycled swap back into free RAM." || true
+                      fi
+
+                      echo "--- [POST-REMEDIATION HEALTH VERIFICATION] ---"
+                      free -m
+                      df -h /
+                      echo "[SELF_HEALING_COMPLETE] timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") incident_id=${INCIDENT} status=RECOVERED"
+                      echo "================================================================================"
+                    } | tee -a "$LOG_FILE"
+                  fi
+
+  # ============================================================================
+  # 6. SSM RUNBOOK 2: LOAD INDUCER (MEMORY -> SWAP -> DISK SPACE -> EBS I/O)
+  # ============================================================================
+  InduceOSLoadDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub ${AWS::StackName}-InduceOSLoad
+      DocumentType: Command
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '2.2'
+        description: >-
+          Induces controlled operating system load on the EC2 instance:
+          memory exhaustion, swap exhaustion, disk space exhaustion, EBS throughput/IOPS saturation,
+          or a sequential chained progression across all four stages.
+        parameters:
+          LoadMode:
+            type: String
+            default: chained
+            allowedValues:
+              - memory
+              - swap
+              - disk_space
+              - ebs_io
+              - chained
+              - stop
+            description: Type of OS load to induce on the EC2 instance.
+          DurationSeconds:
+            type: String
+            default: '90'
+            description: Duration in seconds for each load stage.
+        mainSteps:
+          - action: aws:runShellScript
+            name: ExecuteLoadInjection
+            inputs:
+              runCommand:
+                - |
+                  #!/bin/bash
+                  set -u
+                  LOAD_LOG="/var/log/da-forensics/load-generator.log"
+                  mkdir -p /var/log/da-forensics
+                  MODE="{{ LoadMode }}"
+                  DURATION="{{ DurationSeconds }}"
+
+                  log_msg() {
+                    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [LOAD_INDUCER] [mode=${MODE}] $1" | tee -a "$LOAD_LOG"
+                  }
+
+                  # Stop any previous load first
+                  pkill -9 -f "stress-ng" 2>/dev/null || true
+                  pkill -9 -f "fio" 2>/dev/null || true
+                  pkill -9 -f "dd if=/dev/zero" 2>/dev/null || true
+                  rm -rf /var/tmp/da-disk-ballast* /var/tmp/da-io-test*
+
+                  if [ "$MODE" = "stop" ]; then
+                    sync
+                    swapoff -a && swapon -a || true
+                    log_msg "All synthetic load processes stopped and ballast files removed."
+                    exit 0
+                  fi
+
+                  # Run background script so SSM Command returns immediately while load executes
+                  cat << 'EOF_RUNNER' > /usr/local/bin/da-chained-load.sh
+                  #!/bin/bash
+                  MODE="$1"
+                  DURATION="$2"
+                  LOAD_LOG="/var/log/da-forensics/load-generator.log"
+
+                  log_stage() {
+                    echo "$(date -u +"%Y-%m-%dT%H:%M:%SZ") [LOAD_STAGE] $1" >> "$LOAD_LOG"
+                  }
+
+                  run_memory_exhaustion() {
+                    MEM_TOTAL_MB=$(free -m | awk '/^Mem:/ {print $2}')
+                    TARGET_MB=$(( MEM_TOTAL_MB * 86 / 100 ))
+                    log_stage "STAGE 1 (MEMORY EXHAUSTION): Allocating ${TARGET_MB}MB RAM (~86% of ${MEM_TOTAL_MB}MB physical RAM) for ${DURATION}s..."
+                    stress-ng --vm 2 --vm-bytes "${TARGET_MB}M" --vm-keep --vm-populate --timeout "${DURATION}s" >> "$LOAD_LOG" 2>&1 || true
+                    log_stage "STAGE 1 (MEMORY EXHAUSTION): Completed."
+                  }
+
+                  run_swap_exhaustion() {
+                    MEM_TOTAL_MB=$(free -m | awk '/^Mem:/ {print $2}')
+                    SWAP_TOTAL_MB=$(free -m | awk '/^Swap:/ {print $2}')
+                    # Allocate 92% of RAM + 65% of Swap to force heavy swap paging without triggering instant kernel panic
+                    TARGET_MB=$(( (MEM_TOTAL_MB * 92 / 100) + (SWAP_TOTAL_MB * 65 / 100) ))
+                    log_stage "STAGE 2 (SWAP EXHAUSTION): Allocating ${TARGET_MB}MB across RAM + Swap (SwapTotal=${SWAP_TOTAL_MB}MB) for ${DURATION}s..."
+                    stress-ng --vm 4 --vm-bytes "${TARGET_MB}M" --vm-keep --timeout "${DURATION}s" >> "$LOAD_LOG" 2>&1 || true
+                    log_stage "STAGE 2 (SWAP EXHAUSTION): Completed."
+                  }
+
+                  run_disk_space_exhaustion() {
+                    ROOT_TOTAL_KB=$(df --output=size / | tail -1 | tr -dc '0-9')
+                    ROOT_USED_KB=$(df --output=used / | tail -1 | tr -dc '0-9')
+                    # Target 90% root disk utilization
+                    TARGET_USED_KB=$(( ROOT_TOTAL_KB * 90 / 100 ))
+                    BALLAST_KB=$(( TARGET_USED_KB - ROOT_USED_KB ))
+                    if [ "$BALLAST_KB" -gt 102400 ]; then
+                      BALLAST_MB=$(( BALLAST_KB / 1024 ))
+                      log_stage "STAGE 3 (DISK SPACE EXHAUSTION): Writing ${BALLAST_MB}MB ballast file (/var/tmp/da-disk-ballast.img) to push root disk >90% for ${DURATION}s..."
+                      fallocate -l "${BALLAST_MB}M" /var/tmp/da-disk-ballast.img 2>/dev/null || \
+                        dd if=/dev/zero of=/var/tmp/da-disk-ballast.img bs=1M count="$BALLAST_MB" conv=fdatasync >> "$LOAD_LOG" 2>&1 || true
+                      sync
+                      df -h / >> "$LOAD_LOG"
+                      sleep "$DURATION"
+                      rm -f /var/tmp/da-disk-ballast.img
+                      sync
+                    else
+                      log_stage "STAGE 3 (DISK SPACE EXHAUSTION): Root disk already above target threshold."
+                      sleep "$DURATION"
+                    fi
+                    log_stage "STAGE 3 (DISK SPACE EXHAUSTION): Completed."
+                  }
+
+                  run_ebs_io_exhaustion() {
+                    log_stage "STAGE 4 (EBS THROUGHPUT & IOPS EXHAUSTION): Running fio direct I/O saturation (O_DIRECT, iodepth=64, 8 jobs) for ${DURATION}s..."
+                    mkdir -p /var/tmp/da-io-test
+                    fio --name=ebs_saturate \
+                        --directory=/var/tmp/da-io-test \
+                        --rw=randrw \
+                        --rwmixread=50 \
+                        --bs=64k \
+                        --direct=1 \
+                        --ioengine=libaio \
+                        --iodepth=64 \
+                        --numjobs=4 \
+                        --size=256M \
+                        --runtime="$DURATION" \
+                        --time_based \
+                        --group_reporting >> "$LOAD_LOG" 2>&1 || true
+                    rm -rf /var/tmp/da-io-test
+                    log_stage "STAGE 4 (EBS THROUGHPUT & IOPS EXHAUSTION): Completed."
+                  }
+
+                  case "$MODE" in
+                    memory)
+                      run_memory_exhaustion
+                      ;;
+                    swap)
+                      run_swap_exhaustion
+                      ;;
+                    disk_space)
+                      run_disk_space_exhaustion
+                      ;;
+                    ebs_io)
+                      run_ebs_io_exhaustion
+                      ;;
+                    chained)
+                      log_stage "Starting CHAINED 4-Stage Exhaustion Sequence (Memory -> Swap -> Disk Space -> EBS I/O)..."
+                      run_memory_exhaustion
+                      sleep 10
+                      run_swap_exhaustion
+                      sleep 10
+                      run_disk_space_exhaustion
+                      sleep 10
+                      run_ebs_io_exhaustion
+                      log_stage "Finished CHAINED 4-Stage Exhaustion Sequence."
+                      ;;
+                  esac
+                  EOF_RUNNER
+
+                  chmod +x /usr/local/bin/da-chained-load.sh
+                  nohup /usr/local/bin/da-chained-load.sh "$MODE" "$DURATION" >/dev/null 2>&1 &
+                  BG_PID=$!
+                  log_msg "Started background load generator PID=${BG_PID} with mode=${MODE}, stage_duration=${DURATION}s."
+
+  # ============================================================================
+  # 7. LAMBDA 1: LOAD INDUCER LAMBDA FUNCTION
+  #    Triggers SSM Document on the EC2 instance to induce Memory/Swap/Disk/EBS load
+  # ============================================================================
+  LoadInducerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-LoadInducer-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowSSMSendLoadCommand
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${InduceOSLoadDocument}
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${TargetEC2Instance}
+                  - !Sub arn:aws:ssm:${AWS::Region}:*:managed-instance/*
+
+  LoadInducerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-LoadInducer
+      Description: >-
+        Induces OS load on the target EC2 instance (memory, swap, disk_space, ebs_io, chained, or stop)
+        via AWS Systems Manager Run Command.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LoadInducerLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TARGET_INSTANCE_ID: !Ref TargetEC2Instance
+          SSM_LOAD_DOCUMENT: !Ref InduceOSLoadDocument
+          FORENSICS_LOG_GROUP: !Ref OSForensicsLogGroup
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+
+          ssm = boto3.client("ssm")
+
+          VALID_MODES = {"memory", "swap", "disk_space", "ebs_io", "chained", "stop"}
+
+          def lambda_handler(event, context):
+              """
+              Expected event payload:
+              {
+                "mode": "chained" | "memory" | "swap" | "disk_space" | "ebs_io" | "stop",
+                "duration_seconds": 90,
+                "instance_id": "i-xxxxxxxx" (optional override)
+              }
+              """
+              print(f"Received load induction request: {json.dumps(event)}")
+              mode = str(event.get("mode", "chained")).lower()
+              if mode not in VALID_MODES:
+                  return {
+                      "statusCode": 400,
+                      "body": json.dumps({
+                          "error": f"Invalid mode '{mode}'. Valid modes: {sorted(VALID_MODES)}"
+                      })
+                  }
+
+              duration = str(int(event.get("duration_seconds", 90)))
+              instance_id = event.get("instance_id") or os.environ["TARGET_INSTANCE_ID"]
+              document_name = os.environ["SSM_LOAD_DOCUMENT"]
+              log_group = os.environ["FORENSICS_LOG_GROUP"]
+
+              response = ssm.send_command(
+                  InstanceIds=[instance_id],
+                  DocumentName=document_name,
+                  Comment=f"Induce OS load mode={mode} duration={duration}s",
+                  Parameters={
+                      "LoadMode": [mode],
+                      "DurationSeconds": [duration]
+                  },
+                  CloudWatchOutputConfig={
+                      "CloudWatchLogGroupName": log_group,
+                      "CloudWatchOutputEnabled": True
+                  }
+              )
+
+              command_id = response["Command"]["CommandId"]
+              result = {
+                  "status": "LOAD_INJECTION_STARTED",
+                  "commandId": command_id,
+                  "instanceId": instance_id,
+                  "mode": mode,
+                  "stageDurationSeconds": int(duration),
+                  "ssmDocument": document_name,
+                  "cloudWatchLogGroup": log_group
+              }
+              print(json.dumps(result))
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps(result)
+              }
+
+  # ============================================================================
+  # 8. LAMBDA 2: ALARM-TO-DEVOPS-AGENT WEBHOOK BRIDGE & FORENSIC TRIGGER
+  #    1) Picks up CloudWatch Alarm via SNS
+  #    2) Triggers SSM OS Forensics & Self-Heal Runbook on the EC2 instance
+  #    3) Formats & HMAC-SHA256 signs Incident Payload for AWS DevOps Agent Space
+  # ============================================================================
+  AlarmBridgeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-AlarmBridge-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowForensicRunbookAndWebhookSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${OSForensicsAndSelfHealDocument}
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                  - !Sub arn:aws:ssm:${AWS::Region}:*:managed-instance/*
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DevOpsAgentWebhookSecretResource
+
+  AlarmBridgeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-AlarmToDevOpsAgentBridge
+      Description: >-
+        Receives CloudWatch OS Alarms, triggers the SSM OS Forensic Dump & Self-Healing Runbook,
+        and dispatches a signed HMAC-SHA256 incident payload to the AWS DevOps Agent Space Webhook.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AlarmBridgeLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          TARGET_INSTANCE_ID: !Ref TargetEC2Instance
+          FORENSIC_SSM_DOCUMENT: !Ref OSForensicsAndSelfHealDocument
+          WEBHOOK_SECRET_ARN: !Ref DevOpsAgentWebhookSecretResource
+          FORENSICS_LOG_GROUP: !Ref OSForensicsLogGroup
+          ENABLE_SELF_HEALING: !Ref EnableAutoSelfHealing
+          SELF_HEAL_DELAY_SECONDS: !Sub '${SelfHealDelaySeconds}'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import hmac
+          import hashlib
+          import base64
+          import time
+          import urllib.request
+          import urllib.error
+          from datetime import datetime, timezone
+          import boto3
+
+          ssm = boto3.client("ssm")
+          secrets = boto3.client("secretsmanager")
+
+          def classify_breach(alarm_name: str, metric_name: str) -> str:
+              combined = f"{alarm_name} {metric_name}".lower()
+              if "swap" in combined:
+                  return "SWAP"
+              if "mem" in combined:
+                  return "MEMORY"
+              if "disk_used" in combined or "diskspace" in combined or "used_percent" in combined:
+                  return "DISK_SPACE"
+              if "io" in combined or "ebs" in combined or "throughput" in combined:
+                  return "EBS_IO"
+              return "ALL"
+
+          def extract_metric_name(alarm_msg: dict) -> str:
+              trigger = alarm_msg.get("Trigger", {})
+              if trigger.get("MetricName"):
+                  return trigger["MetricName"]
+              for m in trigger.get("Metrics", []):
+                  metric_stat = m.get("MetricStat", {})
+                  metric = metric_stat.get("Metric", {})
+                  if metric.get("MetricName"):
+                      return metric["MetricName"]
+              return "OSMetric"
+
+          def extract_instance_id(alarm_msg: dict, default_instance_id: str) -> str:
+              trigger = alarm_msg.get("Trigger", {})
+              for dim in trigger.get("Dimensions", []):
+                  if dim.get("name") in ("InstanceId", "instance_id") or dim.get("Name") in ("InstanceId", "instance_id"):
+                      return dim.get("value") or dim.get("Value")
+              for m in trigger.get("Metrics", []):
+                  dims = m.get("MetricStat", {}).get("Metric", {}).get("Dimensions", [])
+                  for dim in dims:
+                      if dim.get("name") in ("InstanceId", "instance_id") or dim.get("Name") in ("InstanceId", "instance_id"):
+                          return dim.get("value") or dim.get("Value")
+              return default_instance_id
+
+          def trigger_ssm_forensics_runbook(instance_id: str, breach_type: str, alarm_name: str, incident_id: str) -> str:
+              doc_name = os.environ["FORENSIC_SSM_DOCUMENT"]
+              log_group = os.environ["FORENSICS_LOG_GROUP"]
+              enable_heal = os.environ.get("ENABLE_SELF_HEALING", "true")
+              heal_delay = os.environ.get("SELF_HEAL_DELAY_SECONDS", "30")
+              try:
+                  resp = ssm.send_command(
+                      InstanceIds=[instance_id],
+                      DocumentName=doc_name,
+                      Comment=f"Auto forensics & self-heal for {alarm_name} ({incident_id})",
+                      Parameters={
+                          "BreachType": [breach_type],
+                          "AlarmName": [alarm_name],
+                          "IncidentId": [incident_id],
+                          "EnableSelfHealing": [enable_heal],
+                          "HealDelaySeconds": [heal_delay]
+                      },
+                      CloudWatchOutputConfig={
+                          "CloudWatchLogGroupName": log_group,
+                          "CloudWatchOutputEnabled": True
+                      }
+                  )
+                  cmd_id = resp["Command"]["CommandId"]
+                  print(f"Triggered SSM Forensic Runbook {doc_name} on {instance_id}: CommandId={cmd_id} -> streaming to CloudWatch Log Group {log_group}")
+                  return cmd_id
+              except Exception as exc:
+                  print(f"Warning: Failed to trigger SSM Forensic Runbook on {instance_id}: {exc}")
+                  return f"ERROR: {exc}"
+
+          def send_to_devops_agent(incident_payload: dict) -> dict:
+              secret_arn = os.environ["WEBHOOK_SECRET_ARN"]
+              secret_Data = json.loads(secrets.get_secret_value(SecretId=secret_arn)["SecretString"])
+              webhook_url = secret_Data.get("WEBHOOK_URL", "")
+              webhook_secret = secret_Data.get("WEBHOOK_SECRET", "")
+
+              payload_str = json.dumps(incident_payload, separators=(",", ":"))
+              timestamp = incident_payload["timestamp"]
+
+              # Official AWS DevOps Agent Webhook HMAC-SHA256 Signing Spec:
+              # base64(HMAC-SHA256(secret, f"{timestamp}:{payload_str}"))
+              signature_input = f"{timestamp}:{payload_str}".encode("utf-8")
+              digest = hmac.new(
+                  webhook_secret.encode("utf-8"),
+                  signature_input,
+                  hashlib.sha256
+              ).digest()
+              signature_b64 = base64.b64encode(digest).decode("utf-8")
+
+              headers = {
+                  "Content-Type": "application/json",
+                  "x-amzn-event-timestamp": timestamp,
+                  "x-amzn-event-signature": signature_b64
+              }
+
+              if "placeholder.aidevops.amazonaws.com" in webhook_url:
+                  print("Webhook URL is set to placeholder; skipping live HTTP POST and logging signed payload:")
+                  print(json.dumps({
+                      "webhook_url": webhook_url,
+                      "headers": headers,
+                      "payload": incident_payload
+                  }, indent=2))
+                  return {"status": "DRY_RUN_PLACEHOLDER_URL", "signature": signature_b64}
+
+              req = urllib.request.Request(
+                  webhook_url,
+                  data=payload_str.encode("utf-8"),
+                  headers=headers,
+                  method="POST"
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=15) as res:
+                      body = res.read().decode("utf-8")
+                      print(f"DevOps Agent Webhook response ({res.status}): {body}")
+                      return {"status": "SENT", "httpStatus": res.status, "response": body}
+              except urllib.error.HTTPError as err:
+                  err_body = err.read().decode("utf-8", errors="replace")
+                  print(f"DevOps Agent Webhook HTTP error {err.code}: {err_body}")
+                  return {"status": "HTTP_ERROR", "httpStatus": err.code, "error": err_body}
+              except Exception as exc:
+                  print(f"DevOps Agent Webhook connection error: {exc}")
+                  return {"status": "CONNECTION_ERROR", "error": str(exc)}
+
+          def lambda_handler(event, context):
+              print(f"Incoming event: {json.dumps(event)}")
+              default_instance = os.environ["TARGET_INSTANCE_ID"]
+              log_group = os.environ["FORENSICS_LOG_GROUP"]
+              results = []
+
+              records = event.get("Records", [{"Sns": {"Message": json.dumps(event)}}])
+              for record in records:
+                  raw_msg = record.get("Sns", {}).get("Message", "{}")
+                  try:
+                      alarm_msg = json.loads(raw_msg) if isinstance(raw_msg, str) else raw_msg
+                  except json.JSONDecodeError:
+                      alarm_msg = {"AlarmName": "RawNotification", "NewStateValue": "ALARM", "NewStateReason": raw_msg}
+
+                  alarm_name = alarm_msg.get("AlarmName", "EC2-OS-Anomaly-Alarm")
+                  new_state = alarm_msg.get("NewStateValue", "ALARM")
+                  reason = alarm_msg.get("NewStateReason", "Anomaly band upper threshold breached")
+                  account_id = alarm_msg.get("AWSAccountId", context.invoked_function_arn.split(":")[4])
+                  region = os.environ.get("AWS_REGION", "us-east-1")
+                  metric_name = extract_metric_name(alarm_msg)
+
+                  instance_id = extract_instance_id(alarm_msg, default_instance)
+                  breach_type = classify_breach(alarm_name, metric_name)
+                  now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                  incident_id = f"ec2-{instance_id}-{breach_type.lower()}-{int(time.time())}"
+
+                  # Only trigger SSM dump & new incident investigation when entering ALARM state
+                  ssm_command_id = "SKIPPED_NOT_ALARM_STATE"
+                  action = "updated"
+                  if new_state == "ALARM":
+                      action = "created"
+                      ssm_command_id = trigger_ssm_forensics_runbook(
+                          instance_id=instance_id,
+                          breach_type=breach_type,
+                          alarm_name=alarm_name,
+                          incident_id=incident_id
+                      )
+                  elif new_state == "OK":
+                      action = "resolved"
+
+                  # Construct AWS DevOps Agent Incident Webhook Payload
+                  incident_payload = {
+                      "eventType": "incident",
+                      "incidentId": incident_id,
+                      "action": action,
+                      "priority": "CRITICAL" if breach_type in ("SWAP", "DISK_SPACE") else "HIGH",
+                      "title": f"EC2 OS {breach_type} Anomaly Detected on {instance_id} ({alarm_name})",
+                      "description": (
+                          f"CloudWatch Anomaly Detection Alarm '{alarm_name}' transitioned to {new_state} on EC2 instance {instance_id}. "
+                          f"Reason: {reason}. "
+                          f"Automated SSM Forensic Runbook ({os.environ['FORENSIC_SSM_DOCUMENT']}) was triggered "
+                          f"(CommandId: {ssm_command_id}) and streamed OS process/memory/swap/disk/IO dumps into "
+                          f"CloudWatch Log Group '{log_group}' stream '{instance_id}/forensic-dumps'."
+                      ),
+                      "timestamp": now_iso,
+                      "service": "AmazonEC2",
+                      "data": {
+                          "metadata": {
+                              "accountId": account_id,
+                              "region": region,
+                              "instanceId": instance_id,
+                              "instanceArn": f"arn:aws:ec2:{region}:{account_id}:instance/{instance_id}",
+                              "alarmName": alarm_name,
+                              "alarmType": "CloudWatchAnomalyDetection",
+                              "alarmState": new_state,
+                              "breachCategory": breach_type,
+                              "metricName": metric_name,
+                              "forensicsLogGroup": log_group,
+                              "forensicsLogStream": f"{instance_id}/forensic-dumps",
+                              "loadGeneratorLogStream": f"{instance_id}/load-generator",
+                              "ssmForensicDocument": os.environ["FORENSIC_SSM_DOCUMENT"],
+                              "ssmForensicCommandId": ssm_command_id,
+                              "investigationHint": (
+                                  f"Query CloudWatch Logs group '{log_group}' stream '{instance_id}/forensic-dumps' "
+                                  f"for incident_id='{incident_id}' to inspect exact offending PIDs, VmSwap, RSS, "
+                                  f"uninterruptible D-state processes, and iostat saturation."
+                              )
+                          }
+                      }
+                  }
+
+                  webhook_result = send_to_devops_agent(incident_payload)
+                  results.append({
+                      "incidentId": incident_id,
+                      "instanceId": instance_id,
+                      "breachType": breach_type,
+                      "ssmCommandId": ssm_command_id,
+                      "webhookResult": webhook_result
+                  })
+
+              return {"statusCode": 200, "body": json.dumps(results)}
+
+  # ============================================================================
+  # 9. SNS TOPIC & SUBSCRIPTION FOR CLOUDWATCH ALARMS -> BRIDGE LAMBDA
+  # ============================================================================
+  AlarmsSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-OS-Anomaly-Alarms
+
+  AlarmsSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmsSNSTopic
+      Protocol: lambda
+      Endpoint: !GetAtt AlarmBridgeLambda.Arn
+
+  AllowSNSInvokeAlarmBridgeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlarmBridgeLambda
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlarmsSNSTopic
+
+  # ============================================================================
+  # 10. CLOUDWATCH ANOMALY DETECTORS & ANOMALY-BASED OS ALARMS
+  #     (MEMORY, SWAP, DISK SPACE, EBS I/O & CPU IOWAIT STALL)
+  # ============================================================================
+  MemoryAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      Namespace: CWAgent
+      MetricName: mem_used_percent
+      Statistic: Average
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TargetEC2Instance
+
+  HighMemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: MemoryAnomalyDetector
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-1-MemoryAnomalyAlarm
+      AlarmDescription: >-
+        EC2 Physical Memory utilization exceeded the CloudWatch Anomaly Detection upper band.
+        Triggers SSM OS Forensics dump to CloudWatch Logs and initiates AWS DevOps Agent investigation.
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      ComparisonOperator: GreaterThanUpperThreshold
+      ThresholdMetricId: ad1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m1
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: CWAgent
+              MetricName: mem_used_percent
+              Dimensions:
+                - Name: InstanceId
+                  Value: !Ref TargetEC2Instance
+            Period: 60
+            Stat: Average
+        - Id: ad1
+          Expression: !Sub ANOMALY_DETECTION_BAND(m1, ${AnomalyDetectionBandWidth})
+          Label: mem_used_percent (Expected Band)
+          ReturnData: true
+      AlarmActions:
+        - !Ref AlarmsSNSTopic
+      OKActions:
+        - !Ref AlarmsSNSTopic
+
+  SwapAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      Namespace: CWAgent
+      MetricName: swap_used_percent
+      Statistic: Average
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TargetEC2Instance
+
+  HighSwapAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: SwapAnomalyDetector
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-2-SwapAnomalyAlarm
+      AlarmDescription: >-
+        EC2 Swap utilization exceeded the CloudWatch Anomaly Detection upper band.
+        Triggers SSM OS Forensics dump and AWS DevOps Agent investigation.
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      ComparisonOperator: GreaterThanUpperThreshold
+      ThresholdMetricId: ad1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m1
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: CWAgent
+              MetricName: swap_used_percent
+              Dimensions:
+                - Name: InstanceId
+                  Value: !Ref TargetEC2Instance
+            Period: 60
+            Stat: Average
+        - Id: ad1
+          Expression: !Sub ANOMALY_DETECTION_BAND(m1, ${AnomalyDetectionBandWidth})
+          Label: swap_used_percent (Expected Band)
+          ReturnData: true
+      AlarmActions:
+        - !Ref AlarmsSNSTopic
+      OKActions:
+        - !Ref AlarmsSNSTopic
+
+  DiskSpaceAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      Namespace: CWAgent
+      MetricName: disk_used_percent
+      Statistic: Average
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TargetEC2Instance
+
+  HighDiskSpaceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: DiskSpaceAnomalyDetector
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-3-DiskSpaceAnomalyAlarm
+      AlarmDescription: >-
+        EC2 Root Filesystem disk usage exceeded the CloudWatch Anomaly Detection upper band.
+        Triggers SSM OS Forensics dump (protected via tmpfs /var/log/da-forensics) and AWS DevOps Agent investigation.
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      ComparisonOperator: GreaterThanUpperThreshold
+      ThresholdMetricId: ad1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m1
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: CWAgent
+              MetricName: disk_used_percent
+              Dimensions:
+                - Name: InstanceId
+                  Value: !Ref TargetEC2Instance
+            Period: 60
+            Stat: Average
+        - Id: ad1
+          Expression: !Sub ANOMALY_DETECTION_BAND(m1, ${AnomalyDetectionBandWidth})
+          Label: disk_used_percent (Expected Band)
+          ReturnData: true
+      AlarmActions:
+        - !Ref AlarmsSNSTopic
+      OKActions:
+        - !Ref AlarmsSNSTopic
+
+  EBSIOSaturationAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      Namespace: CWAgent
+      MetricName: diskio_io_time
+      Statistic: Sum
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TargetEC2Instance
+
+  HighEBSIOSaturationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: EBSIOSaturationAnomalyDetector
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-4-EBSIOSaturationAnomalyAlarm
+      AlarmDescription: >-
+        EC2 Disk I/O time exceeded the CloudWatch Anomaly Detection upper band, indicating EBS IOPS/Throughput saturation.
+        Triggers SSM OS Forensics dump and AWS DevOps Agent investigation.
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      ComparisonOperator: GreaterThanUpperThreshold
+      ThresholdMetricId: ad1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m1
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: CWAgent
+              MetricName: diskio_io_time
+              Dimensions:
+                - Name: InstanceId
+                  Value: !Ref TargetEC2Instance
+            Period: 60
+            Stat: Sum
+        - Id: ad1
+          Expression: !Sub ANOMALY_DETECTION_BAND(m1, ${AnomalyDetectionBandWidth})
+          Label: diskio_io_time (Expected Band)
+          ReturnData: true
+      AlarmActions:
+        - !Ref AlarmsSNSTopic
+      OKActions:
+        - !Ref AlarmsSNSTopic
+
+  CPUIoWaitAnomalyDetector:
+    Type: AWS::CloudWatch::AnomalyDetector
+    Properties:
+      Namespace: CWAgent
+      MetricName: cpu_usage_iowait
+      Statistic: Average
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref TargetEC2Instance
+
+  HighCPUIoWaitStallAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: CPUIoWaitAnomalyDetector
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-5-CPUIoWaitAnomalyAlarm
+      AlarmDescription: >-
+        EC2 CPU I/O Wait exceeded the CloudWatch Anomaly Detection upper band, indicating OS processes are stalling on saturated EBS I/O or swap thrashing.
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      ComparisonOperator: GreaterThanUpperThreshold
+      ThresholdMetricId: ad1
+      TreatMissingData: notBreaching
+      Metrics:
+        - Id: m1
+          ReturnData: true
+          MetricStat:
+            Metric:
+              Namespace: CWAgent
+              MetricName: cpu_usage_iowait
+              Dimensions:
+                - Name: InstanceId
+                  Value: !Ref TargetEC2Instance
+            Period: 60
+            Stat: Average
+        - Id: ad1
+          Expression: !Sub ANOMALY_DETECTION_BAND(m1, ${AnomalyDetectionBandWidth})
+          Label: cpu_usage_iowait (Expected Band)
+          ReturnData: true
+      AlarmActions:
+        - !Ref AlarmsSNSTopic
+      OKActions:
+        - !Ref AlarmsSNSTopic
+
+Outputs:
+  TargetEC2InstanceId:
+    Description: EC2 Instance ID for chaos load injection and autonomous investigation
+    Value: !Ref TargetEC2Instance
+
+  ForensicsCloudWatchLogGroup:
+    Description: CloudWatch Log Group receiving OS forensic dumps and load generator logs
+    Value: !Ref OSForensicsLogGroup
+
+  OSForensicsSSMDocumentName:
+    Description: SSM Runbook that dumps OS process/memory/swap/disk/IO diagnostics and performs self-healing
+    Value: !Ref OSForensicsAndSelfHealDocument
+
+  InduceLoadSSMDocumentName:
+    Description: SSM Runbook that injects Memory, Swap, Disk Space, or EBS I/O load
+    Value: !Ref InduceOSLoadDocument
+
+  LoadInducerLambdaName:
+    Description: Lambda function to trigger Memory -> Swap -> Disk Space -> EBS I/O exhaustion on the EC2 instance
+    Value: !Ref LoadInducerLambda
+
+  AlarmBridgeLambdaName:
+    Description: Lambda function that bridges CloudWatch Alarms to SSM Forensics and AWS DevOps Agent Webhook
+    Value: !Ref AlarmBridgeLambda
+
+  WebhookSecretArn:
+    Description: Secrets Manager ARN storing the AWS DevOps Agent Webhook URL and HMAC Secret
+    Value: !Ref DevOpsAgentWebhookSecretResource
+EOF_CFN_TEMPLATE
+
+cat << 'EOF_TRIGGER' > "${WORKDIR}/trigger-load.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# Helper to invoke the LoadInducer Lambda Function
+# Usage:
+#   ./scripts/trigger-load.sh [chained|memory|swap|disk_space|ebs_io|stop] [duration_seconds]
+# ==============================================================================
+
+MODE="${1:-chained}"
+DURATION="${2:-90}"
+STACK_NAME="${STACK_NAME:-da-auto-investigation}"
+REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo 'us-east-1')}"
+
+LAMBDA_NAME="${STACK_NAME}-LoadInducer"
+RESPONSE_FILE="/tmp/da-load-response.json"
+
+echo "[+] Invoking ${LAMBDA_NAME} in ${REGION} with mode='${MODE}', duration_seconds=${DURATION}..."
+
+aws lambda invoke \
+  --region "${REGION}" \
+  --function-name "${LAMBDA_NAME}" \
+  --cli-binary-format raw-in-base64-out \
+  --payload "{\"mode\": \"${MODE}\", \"duration_seconds\": ${DURATION}}" \
+  "${RESPONSE_FILE}" >/dev/null
+
+cat "${RESPONSE_FILE}" | jq . 2>/dev/null || cat "${RESPONSE_FILE}"
+echo ""
+echo "[i] OS forensic dumps and self-healing logs are automatically streamed to Amazon CloudWatch Logs:"
+echo "    Log Group: /aws/ec2/${STACK_NAME}/os-forensics"
+EOF_TRIGGER
+chmod +x "${WORKDIR}/trigger-load.sh"
+
+TEMPLATE_FILE="${WORKDIR}/cloudformation/da-auto-investigation-stack.yaml"
+# 1. Auto-discover VPC if VPC_ID not provided
+if [ -z "${VPC_ID:-}" ]; then
+  VPC_ID=$(aws ec2 describe-vpcs \
+    --region "${REGION}" \
+    --filters "Name=is-default,Values=true" \
+    --query "Vpcs[0].VpcId" \
+    --output text 2>/dev/null || true)
+
+  if [ -z "${VPC_ID}" ] || [ "${VPC_ID}" = "None" ]; then
+    VPC_ID=$(aws ec2 describe-vpcs \
+      --region "${REGION}" \
+      --query "Vpcs[0].VpcId" \
+      --output text)
+  fi
+fi
+echo "[+] Using VPC ID    : ${VPC_ID}"
+
+# 2. Auto-discover Subnet in the selected VPC if SUBNET_ID not provided
+if [ -z "${SUBNET_ID:-}" ]; then
+  SUBNET_ID=$(aws ec2 describe-subnets \
+    --region "${REGION}" \
+    --filters "Name=vpc-id,Values=${VPC_ID}" \
+    --query "Subnets[?MapPublicIpOnLaunch==\`true\`]|[0].SubnetId" \
+    --output text 2>/dev/null || true)
+
+  if [ -z "${SUBNET_ID}" ] || [ "${SUBNET_ID}" = "None" ]; then
+    SUBNET_ID=$(aws ec2 describe-subnets \
+      --region "${REGION}" \
+      --filters "Name=vpc-id,Values=${VPC_ID}" \
+      --query "Subnets[0].SubnetId" \
+      --output text)
+  fi
+fi
+echo "[+] Using Subnet ID : ${SUBNET_ID}"
+
+# 3. Check if AWS_DevOps_Agent_Role exists in this account
+ATTACH_AGENT_POLICY="false"
+if aws iam get-role --role-name "${AGENT_ROLE_NAME}" >/dev/null 2>&1; then
+  echo "[+] Found existing DevOps Agent Role '${AGENT_ROLE_NAME}' -> attaching SSM Runbook execution permissions."
+  ATTACH_AGENT_POLICY="true"
+else
+  echo "[i] Role '${AGENT_ROLE_NAME}' not found -> skipping direct role attachment (Bridge Lambda will still trigger SSM Runbook)."
+fi
+
+# 4. Deploy CloudFormation stack
+aws cloudformation deploy \
+  --region "${REGION}" \
+  --stack-name "${STACK_NAME}" \
+  --template-file "${TEMPLATE_FILE}" \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    VpcId="${VPC_ID}" \
+    SubnetId="${SUBNET_ID}" \
+    InstanceType="${INSTANCE_TYPE}" \
+    DevOpsAgentWebhookUrl="${WEBHOOK_URL}" \
+    DevOpsAgentWebhookSecret="${WEBHOOK_SECRET}" \
+    DevOpsAgentRoleName="${AGENT_ROLE_NAME}" \
+    AttachRunbookPolicyToAgentRole="${ATTACH_AGENT_POLICY}" \
+    EnableAutoSelfHealing="${ENABLE_SELF_HEALING}" \
+    AnomalyDetectionBandWidth="${ANOMALY_BAND_WIDTH}"
+
+echo ""
+echo "=================================================================="
+echo " Deployment Complete! Stack Outputs:"
+echo "=================================================================="
+aws cloudformation describe-stacks \
+  --region "${REGION}" \
+  --stack-name "${STACK_NAME}" \
+  --query "Stacks[0].Outputs[*].[OutputKey,OutputValue]" \
+  --output table
+
+echo ""
+echo "=================================================================="
+echo " AWS CloudShell Quick Commands:"
+echo "=================================================================="
+echo " 1. Run Chained Load (Memory -> Swap -> Disk Space -> EBS I/O):"
+echo "    ~/da-auto-investigation/trigger-load.sh chained 90"
+echo ""
+echo " 2. Or Run Individual Stage Load:"
+echo "    ~/da-auto-investigation/trigger-load.sh memory 120"
+echo "    ~/da-auto-investigation/trigger-load.sh swap 120"
+echo "    ~/da-auto-investigation/trigger-load.sh disk_space 120"
+echo "    ~/da-auto-investigation/trigger-load.sh ebs_io 120"
+echo ""
+echo " 3. Stop All Load Immediately:"
+echo "    ~/da-auto-investigation/trigger-load.sh stop"
+echo ""
+echo " [i] All OS Forensic Dumps & Self-Healing outputs stream automatically"
+echo "     from the EC2 instance into Amazon CloudWatch Logs:"
+echo "     Log Group: /aws/ec2/${STACK_NAME}/os-forensics"
+echo "=================================================================="

@@ -1,0 +1,22 @@
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*credentials*
+*secret*.json
+
+# Temporary and runtime outputs
+/tmp/
+*.tmp
+*.log
+*.bak
+da-load-response.json
+
+# OS / Editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+__pycache__/
+*.pyc
